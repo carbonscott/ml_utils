@@ -77,33 +77,26 @@ class MultiHeadAttention(eqx.Module):
 
         return jax.vmap(self.to_out)(v_merged)
 
-    def run(self, x: Float[Array, "t e"]):
-        """ Pretend input doesn't have the batch dimension
-        """
-        # Emit q, k, v from x
-        q, k, v = einops.rearrange(
-            jax.vmap(self.to_qkv)(x),
-            't (three h d) -> three h t d',
-            three=3,
-            h=self.heads
-        )
+class TransformerBlock(eqx.Module):
+    ln1: eqx.nn.LayerNorm
+    ln2: eqx.nn.LayerNorm
+    attn: MultiHeadAttention
+    ff: eqx.nn.Sequential
 
-        # Scaled dot product
-        w = einops.einsum(
-            q, k,
-            'h t_q d, h t_k d -> h t_q t_k'
-        )
-        w /= self.dim_head**0.5
-        w = jax.nn.softmax(w, axis=-1) # Each q over all k should be interpreted as prob distribution
-        v_attn = einops.einsum(
-            w, v,
-            'h t_q t_k, h t_k d -> h t_q d'
-        )
+    def __init__(self,dim: int, heads: int, dim_head: int, use_flash: bool, *, key: PRNGKeyArray):
+        keys = jr.split(key, num=3)
 
-        # Merge heads
-        v_merged = einops.rearrange(
-            v_attn,
-            'h t d -> t (h d)'
-        )
+        self.ln1 = eqx.nn.LayerNorm(dim)
+        self.attn = MultiHeadAttention(dim, heads, dim_head, use_flash, key=keys[0])
+        self.ln2 = eqx.nn.LayerNorm(dim)
+        self.ff = eqx.nn.Sequential([
+            eqx.nn.Linear(dim, 4 * dim, use_bias=False, key=keys[1]),
+            eqx.nn.Lambda(jax.nn.gelu),
+            eqx.nn.Linear(4 * dim, dim, use_bias=False, key=keys[2]),
+        ])
 
-        return jax.vmap(self.to_out)(v_merged)
+    @eqx.filter_jit
+    def __call__(self, x: Float[Array, "t e"]):
+        x = x + self.attn(jax.vmap(self.ln1)(x))
+        x = x + jax.vmap(self.ff)(jax.vmap(self.ln2)(x))
+        return x
