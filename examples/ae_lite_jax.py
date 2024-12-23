@@ -8,10 +8,10 @@ from functools import partial
 
 import einops
 
-from jaxtyping import Array, Float, Int, PyTree, PRNGKeyArray
-from typing import Tuple
-
 import math
+
+from jaxtyping import Array, Float, Int, PyTree, PRNGKeyArray
+from typing import Tuple, Optional
 
 import logging
 logging.basicConfig(
@@ -119,46 +119,24 @@ class TransformerBlock(eqx.Module):
         x = x + jax.vmap(self.ff)(jax.vmap(self.ln2)(x))
         return x
 
-class TransformerEncoder(eqx.Module):
-    layers: list[TransformerBlock]
-
-    def __init__(
-        self,
-        depth: int,
-        dim: int,
-        heads: int,
-        dim_head: int,
-        use_flash: bool,
-        *,
-        key: PRNGKeyArray
-    ):
-        keys = jr.split(key, num=1)
-        self.layers = [
-            TransformerBlock(dim, heads, dim_head, use_flash, key=keys[0]) for _ in range(depth)
-        ]
-
-    @eqx.filter_jit
-    def __call__(self, x: Float[Array, "t e"]):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
 class ViTAutoencoder(eqx.Module):
     patch_size: int
     image_size: int
-    norm_pix: int
     num_patches: int
     patch_embed: eqx.nn.Sequential
     pos_embed: jnp.ndarray
-    encoder: list[TransformerBlock]
+    encoder: Tuple[TransformerBlock, ...]
     to_latent: eqx.nn.Sequential
     from_latent: eqx.nn.Sequential
-    decoder: list[TransformerBlock]
+    decoder: Tuple[TransformerBlock, ...]
     to_pixel: eqx.nn.Sequential
+    h_patches: int
+    w_patches: int
+    norm_pix: bool = eqx.field(static=True)
 
     def __init__(
         self,
-        image_size: Tuple[int],
+        image_size: Tuple[int, int],
         patch_size: int,
         latent_dim: int,
         depth: int,
@@ -180,6 +158,9 @@ class ViTAutoencoder(eqx.Module):
         self.num_patches = (image_size[0] // patch_size) * (image_size[1] // patch_size)
         patch_dim = 1 * patch_size * patch_size
 
+        # Calculate number of patches in each direction
+        self.h_patches = self.w_patches = int(math.sqrt(self.num_patches))
+
         # -- Encoder
         # Patch embedding
         self.patch_embed = eqx.nn.Sequential([
@@ -192,9 +173,9 @@ class ViTAutoencoder(eqx.Module):
         # See more: https://docs.kidger.site/equinox/faq/#how-to-mark-arrays-as-non-trainable-like-pytorchs-buffers
         self.pos_embed = self.get_sinusoidal_pos_embed(self.num_patches, dim)
 
-        self.encoder = [
+        self.encoder = tuple(
             TransformerBlock(dim, heads, dim_head, use_flash, key=keys[1]) for _ in range(depth)
-        ]
+        )
 
         # -- Latent code
         self.to_latent = eqx.nn.Sequential([
@@ -207,9 +188,9 @@ class ViTAutoencoder(eqx.Module):
         ])
 
         # -- Decoder
-        self.decoder = [
+        self.decoder = tuple(
             TransformerBlock(dim, heads, dim_head, use_flash, key=keys[4]) for _ in range(depth)
-        ]
+        )
 
         # -- Embedding to pixel
         self.to_pixel = eqx.nn.Sequential([
@@ -217,7 +198,6 @@ class ViTAutoencoder(eqx.Module):
             eqx.nn.Linear(dim, patch_dim, use_bias=True, key=keys[5])
         ])
 
-    @eqx.filter_jit
     def get_sinusoidal_pos_embed(
         self,
         num_pos: int,
@@ -251,33 +231,59 @@ class ViTAutoencoder(eqx.Module):
 
     @eqx.filter_jit
     def unpatchify(self, x: Float[Array, "h_w p1_p2_c"]):
-        h_patches = w_patches = int(math.sqrt(self.num_patches))
         return einops.rearrange(x, '(h w) (p1 p2 c) -> c (h p1) (w p2)',
-                                p1=self.patch_size, p2=self.patch_size, h=h_patches)
+                                p1=self.patch_size, p2=self.patch_size, h=self.h_patches, w=self.w_patches)
+
+    @eqx.filter_jit
+    def normalize_patches(self, patches: Float[Array, "num_patch patch_size_squared"]):
+        if not self.norm_pix:
+            return patches
+        mean = patches.mean(axis=-1, keepdims=True)
+        var = patches.var(axis=-1, keepdims=True)
+        patches = (patches - mean) / (var + 1e-6)**0.5
+        return patches
+
+    @eqx.filter_jit
+    def denormalize_patches(self, patches: Float[Array, "num_patch patch_size_squared"], orig_mean: Float[Array, "num_patch 1"], orig_var: Float[Array, "num_patch 1"]):
+        if not self.norm_pix:
+            return patches
+        return patches * (orig_var + 1e-6)**0.5 + orig_mean
 
     @eqx.filter_jit
     def encode(self, x: Float[Array, "c h w"]):
         patches = self.patchify(x)
+
+        # Need original statistics for denormalization
+        orig_mean, orig_var = None, None
+        if self.norm_pix:
+            orig_mean = patches.mean(axis=-1, keepdims=True)
+            orig_var = patches.var(axis=-1, keepdims=True)
+            patches = self.normalize_patches(patches)
+
         tokens = jax.vmap(self.patch_embed)(patches) + jax.lax.stop_gradient(self.pos_embed) # vmap handles patch dim
                                                                                              # outer vmap handles batch dim
         for encoder_block in self.encoder:
             tokens = tokens + encoder_block(tokens)
         tokens = einops.rearrange(tokens, 't e -> (t e)')
         latent = self.to_latent(tokens)
-        return latent
+
+        return latent, orig_mean, orig_var
 
     @eqx.filter_jit
-    def decode(self, z: Float[Array, "latent_dim"]):
+    def decode(self, z: Float[Array, "latent_dim"], orig_mean: Optional[Float[Array, "num_patch 1"]], orig_var: Optional[Float[Array, "num_patch 1"]]):
         tokens = self.from_latent(z)
         tokens = einops.rearrange(tokens, '(t e) -> t e', t=self.num_patches)
         for decoder_block in self.decoder:
             tokens = tokens + decoder_block(tokens)
         patches = jax.vmap(self.to_pixel)(tokens)
+
+        if self.norm_pix:
+            patches = self.denormalize_patches(patches, orig_mean, orig_var)
         recon = self.unpatchify(patches)
         return recon
 
     @eqx.filter_jit
     def __call__(self, x: Float[Array, "c h w"]):
-        latent = self.encode(x)
-        recon  = self.decode(latent)
+        latent, orig_mean, orig_var = self.encode(x)
+        recon  = self.decode(latent, orig_mean, orig_var)
         return recon
