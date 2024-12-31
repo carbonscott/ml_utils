@@ -64,7 +64,7 @@ inputs = jr.normal(keys[0], (batch_size, input_dim))
 targets = jr.normal(keys[1], (batch_size, output_dim))
 
 # Define training loop
-lr = 1e-3
+lr = 1e-5
 total_interations = 30
 value_and_grad= jax.jit(jax.value_and_grad(calc_loss))
 for iteration in range(total_interations):
