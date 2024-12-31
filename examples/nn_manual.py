@@ -153,8 +153,8 @@ def shard_4way():
     inputs, targets = jax.device_put((inputs, targets), batch_sharding)
 
     # Shard params
-    weight_sharding = jax.sharding.NamedSharding(mesh, P(None,'model'))
-    bias_sharding = jax.sharding.NamedSharding(mesh, P(None,))
+    weight_sharding = jax.sharding.NamedSharding(mesh, P(None,'model')) # weight has a shape of [:,:], so P(None,'model') means to shard along the dim 1 ('model' dim).
+    bias_sharding = jax.sharding.NamedSharding(mesh, P(None,)) # bias has a shape of [:,], so P(None,) should only have one direction too
     params = [
         (jax.device_put(W, weight_sharding), jax.device_put(b, bias_sharding))
         for W, b in params
